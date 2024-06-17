@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
+    "k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
@@ -75,15 +77,124 @@ func (meta *pvcMetadata) stringParser(str string) string {
 
 const (
 	mountPath = "/persistentvolumes"
+	disksFilePath = "/persistentvolumes/disks.txt"
 )
 
 var _ controller.Provisioner = &nfsProvisioner{}
+
+// add_allocated_size adds the allocated size to disks.txt
+func (p *nfsProvisioner) add_allocated_size(pvcname string, n_octets int64) bool {
+    fmt.Println("The value of pvcname is:", pvcname)
+    fmt.Println("The value of n_octets is:", n_octets)
+	totalToAllocateStr := os.Getenv("TOTAL_TO_ALLOCATE")
+    fmt.Println("The value of totalToAllocateStr is:", totalToAllocateStr)
+	if totalToAllocateStr == "" {
+		return false
+	}
+	totalToAllocate, err := strconv.ParseInt(totalToAllocateStr, 10, 64)
+	if err != nil {
+		return false
+	}
+    fmt.Println("Total to allocate is:", totalToAllocate)
+
+	file, err := os.OpenFile(disksFilePath, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		glog.Errorf("failed to open disks.txt: %v", err)
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var allocatedSize int64
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ",")
+		if len(parts) != 2 {
+			continue
+		}
+		name := parts[0]
+		size, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if name == pvcname {
+			glog.Errorf("pvcname %s already exists in disks.txt", pvcname)
+			return false
+		}
+		allocatedSize += size
+	}
+
+	if allocatedSize+n_octets > totalToAllocate {
+		return false
+	}
+
+	if _, err := file.WriteString(fmt.Sprintf("%s,%d\n", pvcname, n_octets)); err != nil {
+		glog.Errorf("failed to write to disks.txt: %v", err)
+		return false
+	}
+
+	return true
+}
+
+// delete_allocated_size deletes the allocated size entry from disks.txt
+func (p *nfsProvisioner) delete_allocated_size(pvcname string) bool {
+	fmt.Println("Deleting from disks.txt: %v", pvcname)
+	file, err := os.OpenFile(disksFilePath, os.O_RDWR, 0o644)
+	if err != nil {
+		glog.Errorf("failed to open disks.txt: %v", err)
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ",")
+		if len(parts) != 2 {
+			continue
+		}
+		name := parts[0]
+		if name == pvcname {
+			fmt.Println("Pruning: %v", name)
+			found = true
+			continue
+		}
+		fmt.Println("Keeping: %v", name)
+		lines = append(lines, line)
+	}
+
+	if !found {
+		glog.Warningf("pvcname %s not found in disks.txt", pvcname)
+		return false
+	}
+
+	if err := file.Truncate(0); err != nil {
+		glog.Errorf("failed to truncate disks.txt: %v", err)
+		return false
+	}
+
+	if _, err := file.Seek(0, 0); err != nil {
+		glog.Errorf("failed to seek in disks.txt: %v", err)
+		return false
+	}
+
+	for _, line := range lines {
+		if _, err := file.WriteString(line + "\n"); err != nil {
+			glog.Errorf("failed to write to disks.txt: %v", err)
+			return false
+		}
+	}
+
+	return true
+}
 
 func (p *nfsProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
 	if options.PVC.Spec.Selector != nil {
 		return nil, controller.ProvisioningFinished, fmt.Errorf("claim Selector is not supported")
 	}
-	glog.V(4).Infof("nfs provisioner: VolumeOptions %v", options)
+	fmt.Printf("nfs provisioner: VolumeOptions %v", options)
 
 	pvcNamespace := options.PVC.Namespace
 	pvcName := options.PVC.Name
@@ -119,6 +230,18 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 	if err != nil {
 		return nil, "", err
 	}
+	
+    fmt.Printf("Computing stuff: %d\n", pvName)
+	allocatedSizeQuantity, exists := options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
+	if !exists {
+		return nil, controller.ProvisioningFinished, errors.New("storage size not specified in PVC")
+	}
+    fmt.Printf("Computing stuff: %d\n", allocatedSizeQuantity)
+	allocatedSize := allocatedSizeQuantity.ScaledValue(resource.Mega)
+    fmt.Printf("Total number of Mi: %d\n", allocatedSize)	
+	if !p.add_allocated_size(options.PVName, allocatedSize) {
+		return nil, controller.ProvisioningFinished, errors.New("unable to allocate the requested size")
+	}
 
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
@@ -145,8 +268,11 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 
 func (p *nfsProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume) error {
 	path := volume.Spec.PersistentVolumeSource.NFS.Path
+	fmt.Printf("Deleting: %d\n", path)
 	basePath := filepath.Base(path)
+	fmt.Printf("Deleting: %d\n", basePath)
 	oldPath := strings.Replace(path, p.path, mountPath, 1)
+	fmt.Printf("Archiving to: %d\n", oldPath)
 
 	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
 		glog.Warningf("path %s does not exist, deletion skipped", oldPath)
@@ -162,10 +288,19 @@ func (p *nfsProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume
 	// If it exists and has a `delete` value, delete the directory.
 	// If it exists and has a `retain` value, safe the directory.
 	onDelete := storageClass.Parameters["onDelete"]
+	fmt.Printf("Just cleaning up... %s\n", onDelete)
 	switch onDelete {
 	case "delete":
+		fmt.Printf("Deleting completely")
+		p.delete_allocated_size(volume.Name)
 		return os.RemoveAll(oldPath)
 	case "retain":
+		fmt.Printf("Retaining For some reason")
+		p.delete_allocated_size(volume.Name)
+		return nil
+	default:
+		fmt.Printf("Just cleaning up...")
+		p.delete_allocated_size(volume.Name)
 		return nil
 	}
 
@@ -265,6 +400,18 @@ func main() {
 		client: clientset,
 		server: server,
 		path:   path,
+	}
+
+	// Check if disks.txt exists, and create it if it does not.
+	if _, err := os.Stat(disksFilePath); os.IsNotExist(err) {
+		fmt.Println("Creating disks.txt")
+		file, err := os.Create(disksFilePath)
+		if err != nil {
+			fmt.Println("I failed...")
+			glog.Fatalf("Failed to create disks.txt: %v", err)
+		}
+		file.Close()
+		fmt.Println("Created disks.txt")
 	}
 	// Start the provision controller which will dynamically provision efs NFS
 	// PVs
